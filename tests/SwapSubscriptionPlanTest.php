@@ -4,23 +4,12 @@ namespace Laravel\Cashier\Tests;
 
 use Illuminate\Support\Facades\Event;
 use Laravel\Cashier\Cashier;
+use Laravel\Cashier\Events\OrderProcessed;
 use Laravel\Cashier\Events\SubscriptionPlanSwapped;
-use Laravel\Cashier\Mollie\Contracts\CreateMolliePayment;
-use Laravel\Cashier\Mollie\Contracts\GetMollieMandate;
-use Laravel\Cashier\Mollie\Contracts\GetMollieMethodMinimumAmount;
-use Laravel\Cashier\Mollie\GetMollieCustomer;
-use Laravel\Cashier\Mollie\GetMollieMethodMaximumAmount;
 use Laravel\Cashier\Order\Order;
-use Laravel\Cashier\Order\OrderItem;
 use Laravel\Cashier\Subscription;
 use Laravel\Cashier\Tests\Database\Factories\OrderItemFactory;
 use Laravel\Cashier\Tests\Database\Factories\SubscriptionFactory;
-use Mollie\Api\MollieApiClient;
-use Mollie\Api\Resources\Customer;
-use Mollie\Api\Resources\Mandate;
-use Mollie\Api\Resources\Payment;
-use Money\Currency;
-use Money\Money;
 
 class SwapSubscriptionPlanTest extends BaseTestCase
 {
@@ -28,7 +17,6 @@ class SwapSubscriptionPlanTest extends BaseTestCase
     {
         parent::setUp();
 
-        $this->withPackageMigrations();
         $this->withTestNow('2019-1-1');
         $this->withConfiguredPlans();
 
@@ -39,8 +27,8 @@ class SwapSubscriptionPlanTest extends BaseTestCase
     public function canSwapToAnotherPlan()
     {
         $now = now();
-        $this->withMockedGetMollieCustomer();
-        $this->withMockedGetMollieMandate();
+        $this->withMockedGetMollieCustomer(2);
+        $this->withMockedGetMollieMandateAccepted(2);
         $this->withMockedGetMollieMethodMinimumAmount();
         $this->withMockedGetMollieMethodMaximumAmount();
         $this->withMockedCreateMolliePayment();
@@ -122,6 +110,90 @@ class SwapSubscriptionPlanTest extends BaseTestCase
         $this->assertFalse($scheduled_order_item->isProcessed());
     }
 
+    /**
+     * @test
+     */
+    public function canSwapToAnotherPlanWithImmediatelyAppliedCoupon()
+    {
+        $now = now();
+        $this->withMockedGetMollieCustomer(2);
+        $this->withMockedGetMollieMandateAccepted(2);
+        $this->withMockedGetMollieMethodMinimumAmount();
+        $this->withMockedGetMollieMethodMaximumAmount();
+        $this->withMockedCreateMolliePayment();
+        $this->withMockedCouponRepository();
+
+        $user = $this->getUserWithZeroBalance();
+        $subscription = $user->subscriptions()->save(SubscriptionFactory::new()->make([
+            'name' => 'dummy name',
+            'plan' => 'monthly-10-1',
+            'cycle_started_at' => now(),
+            'cycle_ends_at' => now()->addMonth(),
+            'tax_percentage' => 10,
+        ]));
+        $alreadyPaidOrderItem = OrderItemFactory::new()->create([
+            'owner_id' => $user->id,
+            'order_id' => 1,
+            'unit_price' => 1000,
+            'tax_percentage' => 10,
+        ]);
+        Order::createProcessedFromItem($alreadyPaidOrderItem, [
+            'id' => 1,
+            'owner_id' => $user->id,
+        ]);
+
+        // redeem coupon
+        $user->redeemCoupon('test-coupon', $subscription->name);
+
+        // Swap to new plan
+        $subscription = $subscription->swap('monthly-20-1')->fresh();
+
+        $this->assertEquals('monthly-20-1', $subscription->plan);
+
+        // Assert that another OrderItem was scheduled for the new subscription plan
+        $newly_scheduled_order_item = $subscription->scheduledOrderItem;
+        $this->assertCarbon($now->copy()->addMonth(), $newly_scheduled_order_item->process_at, 1);
+        $this->assertMoneyEURCents(2200, $newly_scheduled_order_item->getTotal());
+        $this->assertMoneyEURCents(200, $newly_scheduled_order_item->getTax());
+        $this->assertEquals('Monthly payment premium', $newly_scheduled_order_item->description);
+        $this->assertFalse($newly_scheduled_order_item->isProcessed());
+
+        // Assert that the amount "overpaid" for the old plan results in an additional OrderItem with negative total_amount
+        $credit_item = Cashier::$orderItemModel::where('unit_price', '<', 0)->first();
+        $this->assertNotNull($credit_item);
+        $this->assertCarbon($now->copy(), $credit_item->process_at, 1);
+        $this->assertMoneyEURCents(-1100, $credit_item->getTotal());
+        $this->assertMoneyEURCents(-100, $credit_item->getTax());
+        $this->assertEquals('Monthly payment', $credit_item->description);
+        $this->assertTrue($credit_item->isProcessed());
+
+        // Assert that coupon results in an additional OrderItem with negative total_amount
+        $coupon_item = Cashier::$orderItemModel::where('orderable_type', Cashier::$appliedCouponModel)->first();
+        $this->assertNotNull($coupon_item);
+        $this->assertCarbon($now->copy(), $coupon_item->process_at, 1);
+        $this->assertMoneyEURCents(-500, $coupon_item->getTotal());
+        $this->assertMoneyEURCents(0, $coupon_item->getTax());
+        $this->assertEquals('Test coupon', $coupon_item->description);
+        $this->assertTrue($coupon_item->isProcessed());
+
+        Event::assertDispatched(SubscriptionPlanSwapped::class, function (SubscriptionPlanSwapped $event) use ($subscription) {
+            return $subscription->is($event->subscription);
+        });
+
+        Event::assertDispatched(function (OrderProcessed $event) {
+            return $event->order->items()->count() === 3
+                //   2200 costs of new plan
+                // - 1100 reimbursements from old plan
+                // - 500 coupon
+                // = 600
+                && $event->order->total === 600
+                //   200 tax from new plan
+                // - 100 tax from old plan
+                // = 100
+                && $event->order->tax === 100;
+        });
+    }
+
     /** @test */
     public function swappingACancelledSubscriptionResumesIt()
     {
@@ -156,6 +228,24 @@ class SwapSubscriptionPlanTest extends BaseTestCase
         $subscription->swapNextCycle('weekly-20-1');
 
         $this->assertFalse($subscription->cancelled());
+    }
+
+    /** @test */
+    public function swappingOnTrialDoesNotCreateAnOrderEvenWhenInvoiceNowIsTrue()
+    {
+        $subscription = $this->getUser()->subscriptions()->save(
+            SubscriptionFactory::new()->make([
+                'trial_ends_at' => now()->addWeek(),
+                'plan' => 'monthly-20-1',
+            ])
+        );
+
+        $this->assertTrue($subscription->onTrial());
+        $this->assertEquals(0, Order::count());
+
+        $subscription->swap('weekly-20-1', true);
+
+        $this->assertEquals(0, Order::count());
     }
 
     /** @test */
@@ -239,66 +329,5 @@ class SwapSubscriptionPlanTest extends BaseTestCase
             'cycle_ends_at' => now()->subWeeks(2)->addMonth(),
             'tax_percentage' => 10,
         ]));
-    }
-
-    protected function withMockedGetMollieCustomer($customerIds = ['cst_unique_customer_id'], $times = 2): void
-    {
-        $this->mock(GetMollieCustomer::class, function ($mock) use ($customerIds, $times) {
-            foreach ($customerIds as $id) {
-                $customer = new Customer(new MollieApiClient);
-                $customer->id = $id;
-                $mock->shouldReceive('execute')->with($id)->times($times)->andReturn($customer);
-            }
-
-            return $mock;
-        });
-    }
-
-    protected function withMockedGetMollieMandate($attributes = [[
-        'mandateId' => 'mdt_unique_mandate_id',
-        'customerId' => 'cst_unique_customer_id',
-    ]], $times = 2): void
-    {
-        $this->mock(GetMollieMandate::class, function ($mock) use ($times, $attributes) {
-            foreach ($attributes as $data) {
-                $mandate = new Mandate(new MollieApiClient);
-                $mandate->id = $data['mandateId'];
-                $mandate->status = 'valid';
-                $mandate->method = 'directdebit';
-
-                $mock->shouldReceive('execute')->with($data['customerId'], $data['mandateId'])->times($times)->andReturn($mandate);
-            }
-
-            return $mock;
-        });
-    }
-
-    protected function withMockedGetMollieMethodMinimumAmount($times = 1): void
-    {
-        $this->mock(GetMollieMethodMinimumAmount::class, function ($mock) use ($times) {
-            return $mock->shouldReceive('execute')->with('directdebit', 'EUR')->times($times)->andReturn(new Money(100, new Currency('EUR')));
-        });
-    }
-
-    protected function withMockedGetMollieMethodMaximumAmount($times = 1): void
-    {
-        $this->mock(GetMollieMethodMaximumAmount::class, function ($mock) use ($times) {
-            return $mock->shouldReceive('execute')->with('directdebit', 'EUR')->times($times)->andReturn(new Money(30000, new Currency('EUR')));
-        });
-    }
-
-    protected function withMockedCreateMolliePayment($times = 1): void
-    {
-        $this->mock(CreateMolliePayment::class, function ($mock) use ($times) {
-            $payment = new Payment($this->getMollieClientMock());
-            $payment->id = 'tr_dummy_id';
-            $payment->amount = (object) [
-                'currency' => 'EUR',
-                'value' => '10.00',
-            ];
-            $payment->mandateId = 'mdt_dummy_mandate_id';
-
-            return $mock->shouldReceive('execute')->times($times)->andReturn($payment);
-        });
     }
 }

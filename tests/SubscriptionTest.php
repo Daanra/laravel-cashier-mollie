@@ -3,26 +3,21 @@
 namespace Laravel\Cashier\Tests;
 
 use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Factories\Sequence;
 use Illuminate\Support\Facades\Event;
 use Laravel\Cashier\Cashier;
 use Laravel\Cashier\Events\SubscriptionResumed;
-use Laravel\Cashier\Mollie\Contracts\GetMollieMandate;
-use Laravel\Cashier\Mollie\GetMollieCustomer;
 use Laravel\Cashier\Subscription;
 use Laravel\Cashier\Tests\Database\Factories\OrderItemFactory;
 use Laravel\Cashier\Tests\Database\Factories\SubscriptionFactory;
 use Laravel\Cashier\Tests\Fixtures\User;
 use LogicException;
-use Mollie\Api\MollieApiClient;
-use Mollie\Api\Resources\Customer;
-use Mollie\Api\Resources\Mandate;
 
 class SubscriptionTest extends BaseTestCase
 {
     protected function setUp(): void
     {
         parent::setUp();
-        $this->withPackageMigrations();
     }
 
     /** @test */
@@ -152,8 +147,8 @@ class SubscriptionTest extends BaseTestCase
     {
         Carbon::setTestNow(Carbon::parse('2018-01-01'));
         $this->withConfiguredPlans();
-        $this->withMockedGetMollieCustomer('cst_unique_customer_id', 2);
-        $this->withMockedGetMollieMandate();
+        $this->withMockedGetMollieCustomer(2);
+        $this->withMockedGetMollieMandateAccepted(2);
 
         $user = User::factory()->create([
             'mollie_mandate_id' => 'mdt_unique_mandate_id',
@@ -235,8 +230,8 @@ class SubscriptionTest extends BaseTestCase
     {
         Carbon::setTestNow(Carbon::parse('2019-01-29'));
         $this->withConfiguredPlansWithIntervalArray();
-        $this->withMockedGetMollieCustomer('cst_unique_customer_id', 2);
-        $this->withMockedGetMollieMandate();
+        $this->withMockedGetMollieCustomer(2);
+        $this->withMockedGetMollieMandateAccepted(2);
 
         $user = User::factory()->create([
             'mollie_mandate_id' => 'mdt_unique_mandate_id',
@@ -318,8 +313,8 @@ class SubscriptionTest extends BaseTestCase
     {
         Carbon::setTestNow(Carbon::parse('2019-01-31'));
         $this->withConfiguredPlansWithIntervalArray();
-        $this->withMockedGetMollieCustomer('cst_unique_customer_id', 2);
-        $this->withMockedGetMollieMandate();
+        $this->withMockedGetMollieCustomer(2);
+        $this->withMockedGetMollieMandateAccepted(2);
 
         $user = User::factory()->create([
             'mollie_mandate_id' => 'mdt_unique_mandate_id',
@@ -514,32 +509,132 @@ class SubscriptionTest extends BaseTestCase
         $this->assertCarbon(now()->addWeek(), $subscription->cycle_ends_at);
     }
 
-    protected function withMockedGetMollieCustomer($customerId = 'cst_unique_customer_id', $times = 1): void
+    /** @test */
+    public function canQueryActiveSubscriptions()
     {
-        $this->mock(GetMollieCustomer::class, function ($mock) use ($customerId, $times) {
-            $customer = new Customer(new MollieApiClient);
-            $customer->id = $customerId;
+        SubscriptionFactory::new()
+            ->count(4)
+            ->state(new Sequence(
+                ['ends_at' => null],
+                ['trial_ends_at' => now()->addWeek()],
+                ['ends_at' => now()->addMonth()],
+                ['ends_at' => now()],
+            ))
+            ->create();
 
-            return $mock->shouldReceive('execute')->with($customerId)->times($times)->andReturn($customer);
-        });
+        $this->assertEquals(3, Subscription::whereActive()->count());
+        $this->assertEquals(1, Subscription::whereNotActive()->count());
     }
 
-    protected function withMockedGetMollieMandate($attributes = [[
-        'mandateId' => 'mdt_unique_mandate_id',
-        'customerId' => 'cst_unique_customer_id',
-    ]], $times = 2): void
+    /** @test */
+    public function canQueryOnTrialSubscriptions()
     {
-        $this->mock(GetMollieMandate::class, function ($mock) use ($times, $attributes) {
-            foreach ($attributes as $data) {
-                $mandate = new Mandate(new MollieApiClient);
-                $mandate->id = $data['mandateId'];
-                $mandate->status = 'valid';
-                $mandate->method = 'directdebit';
+        SubscriptionFactory::new()
+            ->count(3)
+            ->state(new Sequence(
+                ['trial_ends_at' => now()->subWeek()],
+                ['trial_ends_at' => now()->addWeek()],
+                ['trial_ends_at' => null],
+            ))
+            ->create();
 
-                $mock->shouldReceive('execute')->with($data['customerId'], $data['mandateId'])->times($times)->andReturn($mandate);
-            }
+        $this->assertEquals(1, Subscription::whereOnTrial()->count());
+        $this->assertEquals(2, Subscription::whereNotOnTrial()->count());
+    }
 
-            return $mock;
-        });
+    /** @test */
+    public function canQueryOnGracePeriodSubscriptions()
+    {
+        SubscriptionFactory::new()
+            ->count(3)
+            ->state(new Sequence(
+                ['ends_at' => now()->subWeek()],
+                ['ends_at' => now()->addWeek()],
+                ['ends_at' => null],
+            ))
+            ->create();
+
+        $this->assertEquals(1, Subscription::whereOnGracePeriod()->count());
+        $this->assertEquals(2, Subscription::whereNotOnGracePeriod()->count());
+    }
+
+    /** @test */
+    public function canQueryCancelledSubscriptions()
+    {
+        SubscriptionFactory::new()
+            ->count(3)
+            ->state(new Sequence(
+                ['ends_at' => now()->subWeek()],
+                ['ends_at' => now()->addWeek()],
+                ['ends_at' => null],
+            ))
+            ->create();
+
+        $this->assertEquals(1, Subscription::whereCancelled()->count());
+        $this->assertEquals(2, Subscription::whereNotCancelled()->count());
+    }
+
+    /** @test */
+    public function canQueryRecurringSubscriptions()
+    {
+        SubscriptionFactory::new()
+            ->count(3)
+            ->state(new Sequence(
+                ['trial_ends_at' => null, 'ends_at' => null],
+                ['trial_ends_at' => now()->addWeek(), 'ends_at' => null],
+                ['trial_ends_at' => null, 'ends_at' => now()->subMonth()],
+            ))
+            ->create();
+
+        $this->assertEquals(1, Subscription::whereRecurring()->count());
+        $this->assertEquals(2, Subscription::whereNotRecurring()->count());
+    }
+
+    /** @test */
+    public function halfwayThroughSubscriptionReturnsPositiveReimbursementAmount()
+    {
+        $this->withConfiguredPlans();
+
+        $subscriptionHalfWayThrough = SubscriptionFactory::new()
+            ->has(
+                OrderItemFactory::new(['unit_price' => 100])
+                    ->processed()
+                    ->withOrder()
+                    ->EUR(),
+                'scheduledOrderItem'
+            )
+            ->create([
+                'cycle_started_at' => now()->subDays(20),
+                'cycle_ends_at' => now()->addDays(20),
+            ]);
+
+        $this->assertEquals(
+            money('-50', 'EUR'),
+            $subscriptionHalfWayThrough->getReimbursableAmountForUnusedTime()
+        );
+    }
+
+    /** @test */
+    public function nonReimbursableSubscriptionReturnsNoReimbursementAmount()
+    {
+        $this->withConfiguredPlans();
+
+        $nonReimbursable = SubscriptionFactory::new()
+            ->has(
+                OrderItemFactory::new(['unit_price' => 100])
+                    ->processed()
+                    ->withOrder()
+                    ->EUR(),
+                'scheduledOrderItem'
+            )
+            ->create([
+                'cycle_started_at' => now()->subMonth(),
+                'cycle_ends_at' => now()->subDay(),
+            ]);
+
+        $this->assertEquals(
+            money(0, 'EUR'),
+            $nonReimbursable->getReimbursableAmountForUnusedTime()
+        );
     }
 }
