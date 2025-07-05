@@ -227,6 +227,7 @@ class Order extends Model
                 case $totalDue->isZero():
                     // No payment processing required
                     $this->mollie_payment_id = null;
+                    logger()->info('no payment processing');
 
                     break;
 
@@ -245,10 +246,9 @@ class Order extends Model
 
                 case $totalDue->greaterThanOrEqual($minimumPaymentAmount):
 
-                    // Create Mollie payment
                     $payment = (new MandatedPaymentBuilder(
                         $owner,
-                        'Order ' . $this->number,
+                        $this->getDescription(),
                         $totalDue,
                         url(config('cashier.webhook_url')),
                         [
@@ -634,6 +634,16 @@ class Order extends Model
     }
 
     /**
+     * Get the description used when creating a mollie order.
+     *
+     * @return string
+     */
+    public function getDescription()
+    {
+        return trans('cashier::payment.description', ['number' => $this->number], Cashier::getLocale($this->owner));
+    }
+
+    /**
      * Get an empty refund builder for this order.
      *
      * @return \Laravel\Cashier\Refunds\RefundBuilder
@@ -763,5 +773,10 @@ class Order extends Model
 
             $this->processPayment();
         });
+    }
+
+    public function amountChargedBack(): int
+    {
+        return $this->payments()->sum('amount_charged_back');
     }
 }

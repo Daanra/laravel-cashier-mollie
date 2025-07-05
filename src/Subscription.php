@@ -3,6 +3,7 @@
 namespace Laravel\Cashier;
 
 use Carbon\Carbon;
+use Illuminate\Contracts\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -77,6 +78,68 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
         'created' => SubscriptionStarted::class,
     ];
 
+    public function scopeWhereActive(Builder $query): Builder
+    {
+        return $query->whereNull('ends_at')
+            ->orWhere(fn (Builder $query) => $this->scopeWhereOnTrial($query))
+            ->orWhere(fn (Builder $query) => $this->scopeWhereOnGracePeriod($query));
+    }
+
+    public function scopeWhereNotActive(Builder $query): Builder
+    {
+        return $query->whereNotNull('ends_at')
+            ->where(fn (Builder $query) => $this->scopeWhereNotOnTrial($query))
+            ->where(fn (Builder $query) => $this->scopeWhereNotOnGracePeriod($query));
+    }
+
+    public function scopeWhereCancelled(Builder $query): Builder
+    {
+        return $query->whereNotNull('ends_at')
+            ->where(fn (Builder $query) => $this->scopeWhereNotOnGracePeriod($query));
+    }
+
+    public function scopeWhereNotCancelled(Builder $query): Builder
+    {
+        return $query->whereNull('ends_at')
+            ->orWhere(fn (Builder $query) => $this->scopeWhereOnGracePeriod($query));
+    }
+
+    public function scopeWhereOnTrial(Builder $query): Builder
+    {
+        return $query->whereNotNull('trial_ends_at')
+            ->where('trial_ends_at', '>', now());
+    }
+
+    public function scopeWhereNotOnTrial(Builder $query): Builder
+    {
+        return $query->whereNull('trial_ends_at')
+            ->orWhere('trial_ends_at', '<=', now());
+    }
+
+    public function scopeWhereOnGracePeriod(Builder $query): Builder
+    {
+        return $query->whereNotNull('ends_at')
+            ->where('ends_at', '>', now());
+    }
+
+    public function scopeWhereNotOnGracePeriod(Builder $query): Builder
+    {
+        return $query->whereNull('ends_at')
+            ->orWhere('ends_at', '<=', now());
+    }
+
+    public function scopeWhereRecurring(Builder $query): Builder
+    {
+        return $query->where(fn (Builder $query) => $this->scopeWhereNotOnTrial($query))
+            ->where(fn (Builder $query) => $this->scopeWhereNotCancelled($query));
+    }
+
+    public function scopeWhereNotRecurring(Builder $query): Builder
+    {
+        return $query->where(fn (Builder $query) => $this->scopeWhereOnTrial($query))
+            ->orWhere(fn (Builder $query) => $this->scopeWhereCancelled($query));
+    }
+
     /**
      * Determine if the subscription is valid.
      *
@@ -84,7 +147,7 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
      */
     public function valid()
     {
-        return $this->active() || $this->onTrial() || $this->onGracePeriod();
+        return $this->active();
     }
 
     /**
@@ -174,7 +237,7 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
         $total_cycle_seconds = $cycle_started_at->diffInSeconds($cycle_ends_at);
         $seconds_progressed = $cycle_started_at->diffInSeconds($now);
 
-        return round($seconds_progressed / $total_cycle_seconds, $precision);
+        return abs(round($seconds_progressed / $total_cycle_seconds, $precision));
     }
 
     /**
@@ -550,6 +613,30 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
     }
 
     /**
+     * Gets the amount to be reimbursed for the subscription's unused time.
+     *
+     * Result range value: (-X up to 0)
+     *
+     * @param  \Carbon\Carbon|null  $now
+     * @return \Money\Money
+     */
+    public function getReimbursableAmountForUnusedTime(?Carbon $now = null): Money
+    {
+        $now = $now ?: now();
+
+        if ($this->onTrial()) {
+            return $this->zero();
+        }
+        if (round($this->getCycleLeftAttribute($now), 5) == 0) {
+            return $this->zero();
+        }
+
+        return $this->reimbursableAmount()
+            ->negative()
+            ->multiply(sprintf('%.8F', $this->getCycleLeftAttribute($now)));
+    }
+
+    /**
      * Handle a failed payment.
      *
      * @param  \Laravel\Cashier\Order\OrderItem  $item
@@ -575,10 +662,17 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
         $subscription = $item->orderable;
 
         if ($subscription->ends_at !== null) {
-            $subscription->update([
-                'ends_at' => null,
-                'cycle_ends_at' => $subscription->plan()->interval()->getEndOfNextSubscriptionCycle($subscription)
-            ]);
+            DB::transaction(function () use ($item, $subscription) {
+                if (!$subscription->scheduled_order_item_id) {
+                    $item = $subscription->scheduleNewOrderItemAt($subscription->ends_at);
+                }
+
+                $subscription->fill([
+                    'cycle_ends_at' => $subscription->plan()->interval()->getEndOfNextSubscriptionCycle($subscription),
+                    'ends_at' => null,
+                    'scheduled_order_item_id' => $item->id,
+                ])->save();
+            });
         }
     }
 
@@ -700,12 +794,10 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
      */
     protected function reimbursableAmount()
     {
-        $zeroAmount = new Money('0.00', new Currency($this->currency));
-
         // Determine base amount eligible to reimburse
         $latestProcessedOrderItem = $this->latestProcessedOrderItem();
         if (!$latestProcessedOrderItem) {
-            return $zeroAmount;
+            return $this->zero();
         }
 
         $reimbursableAmount = $latestProcessedOrderItem->getTotal()
@@ -739,7 +831,7 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
 
         // Guard against a negative value
         if ($reimbursableAmount->isNegative()) {
-            return $zeroAmount;
+            return $this->zero();
         }
 
         return $reimbursableAmount;
@@ -794,7 +886,9 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
             // Apply new subscription settings
             call_user_func($applyNewSettings);
 
-            if ($this->onTrial()) {
+            $onTrial = $this->onTrial();
+
+            if ($onTrial) {
 
                 // Reschedule next cycle's OrderItem using the new subscription settings
                 $orderItems[] = $this->scheduleNewOrderItemAt($this->trial_ends_at);
@@ -810,7 +904,7 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
 
             $this->save();
 
-            if ($invoiceNow) {
+            if (!$onTrial && $invoiceNow) {
                 $order = Cashier::$orderModel::createFromItems($orderItems);
                 $order->processPayment();
             }
@@ -876,5 +970,10 @@ class Subscription extends Model implements InteractsWithOrderItems, Preprocesse
     public function latestProcessedOrderItem()
     {
         return $this->orderItems()->processed()->orderByDesc('process_at')->first();
+    }
+
+    private function zero(): Money
+    {
+        return new Money('0.00', new Currency($this->currency));
     }
 }
