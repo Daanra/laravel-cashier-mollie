@@ -12,6 +12,7 @@ use Mollie\Api\Resources\Payment as MolliePayment;
 use Mollie\Api\Types\SequenceType;
 use Money\Currency;
 use Money\Money;
+use PHPUnit\Framework\Attributes\Test;
 
 class FirstPaymentBuilderTest extends BaseTestCase
 {
@@ -22,7 +23,7 @@ class FirstPaymentBuilderTest extends BaseTestCase
         $this->withMockedCreateMollieCustomer();
     }
 
-    /** @test */
+    #[Test]
     public function canBuildPayload()
     {
         $owner = User::factory()->create();
@@ -57,7 +58,7 @@ class FirstPaymentBuilderTest extends BaseTestCase
         $customerId = $payload['customerId'];
         unset($payload['customerId']);
         $check_payload = [
-            'sequenceType' => SequenceType::SEQUENCETYPE_FIRST,
+            'sequenceType' => SequenceType::FIRST,
             'description' => 'Test mandate payment',
             'amount' => [
                 'value' => '10.00',
@@ -80,7 +81,7 @@ class FirstPaymentBuilderTest extends BaseTestCase
         $this->assertEquals(0, $owner->orders()->count());
     }
 
-    /** @test */
+    #[Test]
     public function createsMolliePayment()
     {
         $owner = User::factory()->create();
@@ -117,7 +118,7 @@ class FirstPaymentBuilderTest extends BaseTestCase
         $this->assertInstanceOf(MolliePayment::class, $payment);
     }
 
-    /** @test */
+    #[Test]
     public function parsesRedirectUrlPaymentIdUponPaymentCreation()
     {
         $owner = User::factory()->create();
@@ -136,7 +137,7 @@ class FirstPaymentBuilderTest extends BaseTestCase
         $this->assertEquals('https://www.example.com/tr_unique_id', $payment->redirectUrl);
     }
 
-    /** @test */
+    #[Test]
     public function storesLocalPaymentRecord()
     {
         $owner = User::factory()->create();
